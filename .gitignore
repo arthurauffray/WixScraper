@@ -1,3 +1,4 @@
 local_lists/
 __pycache__/
 scripts/find_wixsites.py
+scripts/evaluate_scrape.py
