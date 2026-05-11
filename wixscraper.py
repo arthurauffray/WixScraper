@@ -1,10 +1,14 @@
 # Import puppeteer
 import json
 from urllib.parse import urlparse
+import urllib.parse
 from pyppeteer import launch
+import re
 import asyncio
 import os
 import requests
+import unicodedata
+import shutil
 from PIL import Image
 
 # Scroll to the bottom to load all content
@@ -29,8 +33,9 @@ async def delete_wix(page):
     await page.evaluate('''() => {
         const elements = document.querySelectorAll('style');
         for (const element of elements) {
-            if (element.innerText.includes('--wix-ads')) {
-                element.innerText = element.innerText.replace('--wix-ads', '');
+            const text = element.textContent || '';
+            if (text.includes('--wix-ads')) {
+                element.textContent = text.replace('--wix-ads', '');
             }
         }
     }''')
@@ -39,7 +44,8 @@ async def delete_wix(page):
     await page.evaluate('''() => {
         const elements = document.querySelectorAll('span');
         for (const element of elements) {
-            if (element.innerText.includes('Made with Wix')) {
+            const text = element.textContent || '';
+            if (text.includes('Made with Wix') && element.parentNode) {
                 element.parentNode.removeChild(element);
             }
         }
@@ -109,29 +115,33 @@ async def fix_gallery(page):
         # Add the above evaluation as a script tag
         await page.addScriptTag(content='''
         window.addEventListener('DOMContentLoaded', function() {
-        var $jq = jQuery.noConflict();
-        $jq(document).ready(function () {
-            $jq('.slick-carousel').slick({
-                dots: true,
-                infinite: true,
-                speed: 300,
-                slidesToShow: 2,
-                responsive: [
-                    {
-                    breakpoint: 1024,
-                    settings: {
-                        slidesToShow: 1,
-                    }
-                    },
-                    {
-                    breakpoint: 600,
-                    settings: {
-                        slidesToShow: 1,
-                    }
-                    }
-                ]
+            if (typeof window.jQuery === 'undefined' || typeof window.jQuery.fn?.slick === 'undefined') {
+                return;
+            }
+
+            var $jq = window.jQuery.noConflict();
+            $jq(function () {
+                $jq('.slick-carousel').slick({
+                    dots: true,
+                    infinite: true,
+                    speed: 300,
+                    slidesToShow: 2,
+                    responsive: [
+                        {
+                        breakpoint: 1024,
+                        settings: {
+                            slidesToShow: 1,
+                        }
+                        },
+                        {
+                        breakpoint: 600,
+                        settings: {
+                            slidesToShow: 1,
+                        }
+                        }
+                    ]
+                });
             });
-        });
         });''')
 
 async def fix_googlemap(page, mapData):
@@ -327,8 +337,12 @@ async def fix_slideshow(page):
 
 slideFix = '''<script>
         window.addEventListener('DOMContentLoaded', function() {
-        var $jq = jQuery.noConflict();
-        $jq(document).ready(function () {
+        if (typeof window.jQuery === 'undefined' || typeof window.jQuery.fn?.slick === 'undefined') {
+            return;
+        }
+
+        var $jq = window.jQuery.noConflict();
+        $jq(function () {
             $jq('.slick-carousel-slides').slick({
                 dots: true,
                 infinite: false,
@@ -381,38 +395,217 @@ async def makeLocalImages(page, hostname, forceDownloadAgain):
     if not os.path.exists(hostname + '/images'):
         os.makedirs(hostname + '/images')
 
-    # Download all images
-    imageLinks = await page.querySelectorAllEval('img', 'nodes => nodes.map(n => n.src)')
+    def build_image_name(link):
+        cleaned_link = link.split('?')[0].split('#')[0]
+        path_part = cleaned_link.split('/')[-1]
+
+        if path_part.lower() == 'file.jpeg':
+            segments = cleaned_link.split('/')
+            media_index = next((index for index, value in enumerate(segments) if value == 'media'), -1)
+            if media_index != -1 and media_index + 1 < len(segments):
+                path_part = segments[media_index + 1]
+
+        return urllib.parse.unquote(path_part)
+
+    # Download all image-like assets used in img tags, picture/srcset tags, and CSS backgrounds.
+    imageLinks = await page.evaluate(r'''() => {
+        const links = new Set();
+
+        const addCandidate = (value) => {
+            if (!value) {
+                return;
+            }
+
+            const trimmed = value.trim().replace(/^url\((.*)\)$/i, '$1').replace(/^['"]|['"]$/g, '');
+            if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:')) {
+                return;
+            }
+
+            if (!/^https?:\/\//i.test(trimmed)) {
+                return;
+            }
+
+            links.add(trimmed);
+        };
+
+        document.querySelectorAll('img').forEach((node) => {
+            addCandidate(node.currentSrc || node.src || node.getAttribute('src'));
+            const srcset = node.getAttribute('srcset') || '';
+            srcset.split(',').forEach((candidate) => addCandidate(candidate.trim().split(/\s+/)[0] || ''));
+        });
+
+        document.querySelectorAll('source').forEach((node) => {
+            const srcset = node.getAttribute('srcset') || '';
+            srcset.split(',').forEach((candidate) => addCandidate(candidate.trim().split(/\s+/)[0] || ''));
+        });
+
+        document.querySelectorAll('*').forEach((node) => {
+            const backgroundImage = getComputedStyle(node).backgroundImage || '';
+            const matches = backgroundImage.match(/url\((.*?)\)/g) || [];
+            matches.forEach((match) => addCandidate(match));
+        });
+
+        return Array.from(links);
+    }''')
 
     for link in imageLinks:
-
-        # If a webp version of the image already exists, skip it
-        if(not forceDownloadAgain and os.path.exists(hostname + '/images/' + link.split('/')[-1].split('.')[0] + '.webp')):
+        if not link or link.startswith('data:') or link.startswith('blob:'):
             continue
 
-        # Fetch each image and save it to the images folder
-        # Download using requests
-        # Get the image name
-        imageName = link.split('/')[-1]
-        r = requests.get(link, allow_redirects=True)
-        open(hostname + '/images/' + imageName, 'wb').write(r.content)
+        # If a webp version of the image already exists, skip it
+        imageName = build_image_name(link)
+        imageBaseName = os.path.splitext(imageName)[0]
 
-        # Convert each image to WebP
-        im = Image.open(hostname + '/images/' + imageName)
-        im.save(hostname + '/images/' + imageName.split('.')[0] + '.webp', 'webp')
+        if(not forceDownloadAgain and os.path.exists(hostname + '/images/' + imageBaseName + '.webp')):
+            continue
+
+        try:
+            # Fetch each image and save it to the images folder
+            # Download using requests
+            r = requests.get(link, allow_redirects=True)
+
+            contentType = r.headers.get('content-type', '')
+            if('image' not in contentType and not imageName.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.svg'))):
+                continue
+
+            open(hostname + '/images/' + imageName, 'wb').write(r.content)
+
+            # Convert each image to WebP
+            im = Image.open(hostname + '/images/' + imageName)
+            im.save(hostname + '/images/' + imageBaseName + '.webp', 'webp')
+        except Exception as e:
+            print(f"Skipping image {link}: {e}")
+            continue
 
         # Delete the original image
         os.remove(hostname + '/images/' + imageName)
 
     # Replace all image links with the local image links, using the webp format
-    await page.evaluate('''() => {
+    await page.evaluate(r'''() => {
+        const buildImageName = (src) => {
+            const cleanedSrc = src.split('?')[0].split('#')[0];
+            const segments = cleanedSrc.split('/');
+            let imageName = segments[segments.length - 1];
+
+            if (imageName.toLowerCase() === 'file.jpeg') {
+                const mediaIndex = segments.findIndex((segment) => segment === 'media');
+                if (mediaIndex !== -1 && mediaIndex + 1 < segments.length) {
+                    imageName = segments[mediaIndex + 1];
+                }
+            }
+
+            return decodeURIComponent(imageName);
+        };
+
         const elements = document.querySelectorAll('img');
         for (const element of elements) {
-            element.src = '/images/' + element.src.split('/').slice(-1)[0].split('.')[0] + '.webp';
+            const src = element.currentSrc || element.getAttribute('src') || '';
+            if (!src || src.startsWith('data:') || src.startsWith('blob:')) {
+                continue;
+            }
+
+            const imageName = buildImageName(src).replace(/\.[^.]+$/, '') + '.webp';
+            element.src = '../images/' + encodeURIComponent(imageName).replace(/%2F/g, '/');
             // remove any srcset
             element.removeAttribute('srcset');
+
+            const picture = element.closest('picture');
+            if (picture) {
+                picture.querySelectorAll('source').forEach((source) => {
+                    source.removeAttribute('srcset');
+                });
+            }
         }
     }''')
+
+
+def build_relative_prefix(page_key):
+    normalized_key = page_key.strip('/')
+
+    if not normalized_key:
+        return ''
+
+    depth = len([segment for segment in normalized_key.split('/') if segment])
+    return '../' * depth
+
+
+def normalize_path_segment(segment):
+    decoded = urllib.parse.unquote(segment).strip().lower()
+    ascii_segment = unicodedata.normalize('NFKD', decoded).encode('ascii', 'ignore').decode('ascii')
+    ascii_segment = re.sub(r'[^a-z0-9\s-]', '', ascii_segment)
+    ascii_segment = re.sub(r'[\s_-]+', '-', ascii_segment)
+    ascii_segment = re.sub(r'-{2,}', '-', ascii_segment).strip('-')
+    return ascii_segment or 'page'
+
+
+def normalize_site_path(raw_path, blockPrimaryFolder=''):
+    parsed = urllib.parse.urlsplit(raw_path)
+    path = parsed.path or raw_path
+
+    if blockPrimaryFolder:
+        primary_prefix = '/' + blockPrimaryFolder.strip('/')
+        if path == primary_prefix:
+            path = '/'
+        elif path.startswith(primary_prefix + '/'):
+            path = path[len(primary_prefix):]
+
+    segments = [normalize_path_segment(segment) for segment in path.split('/') if segment]
+    if not segments:
+        return '/'
+
+    return '/' + '/'.join(segments)
+
+
+def build_local_page_href(raw_path, relative_prefix, blockPrimaryFolder):
+    normalized_path = normalize_site_path('/' + raw_path.lstrip('/'), blockPrimaryFolder)
+    if normalized_path == '/':
+        return f'{relative_prefix}index.html'
+
+    return f'{relative_prefix}{normalized_path.strip("/")}/index.html'
+
+
+def resolve_browser_executable():
+    mac_chrome_paths = [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        os.path.expanduser('~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+    ]
+
+    for browser_path in mac_chrome_paths:
+        if os.path.exists(browser_path):
+            return browser_path
+
+    for browser_name in ('google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'):
+        browser_path = shutil.which(browser_name)
+        if browser_path:
+            return browser_path
+
+    if os.name == 'nt':
+        windows_paths = [
+            r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+            r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+            r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+        ]
+
+        for browser_path in windows_paths:
+            if os.path.exists(browser_path):
+                return browser_path
+
+    return None
+
+
+def rewrite_local_asset_paths(html, relative_prefix):
+    image_prefix = f'{relative_prefix}images/'
+    font_prefix = f'{relative_prefix}fonts/'
+    root_index = f'{relative_prefix}index.html'
+
+    html = re.sub(r'(?<![A-Za-z0-9_./-])\.\./images/', image_prefix, html)
+    html = re.sub(r'(?<![A-Za-z0-9_./-])images/', image_prefix, html)
+    html = re.sub(r'(?<![A-Za-z0-9_./-])\.\./fonts/', font_prefix, html)
+    html = re.sub(r'(?<![A-Za-z0-9_./-])fonts/', font_prefix, html)
+    html = html.replace('href="../index.html"', f'href="{root_index}"')
+
+    return html
 
 async def makeFontsLocal(page, hostname, forceDownloadAgain):
         # Make all fonts local
@@ -421,7 +614,7 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
         os.makedirs(hostname + '/fonts')
 
     # Download all fonts, which are parastorage links
-    fontLinks = await page.querySelectorAllEval('style', 'nodes => nodes.map(n => n.innerText.match(/url\\((.*?)\\)/g)).flat()')
+    fontLinks = await page.querySelectorAllEval('style', 'nodes => nodes.map(n => ((n.textContent || "").match(/url\\((.*?)\\)/g) || [])).flat()')
 
     # Get all url("//static.parastorage.com...") links
     fontLinks = [link for link in fontLinks if link is not None and 'static.parastorage.com' in link]
@@ -442,6 +635,7 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
         fontName = fontName.split('#')[0]
         # Remove any "
         fontName = fontName.replace('"', '')
+        fontName = fontName.replace("'", '')
         
         # If the font already exists, skip it
         if(not forceDownloadAgain and os.path.exists(hostname + '/fonts/' + fontName)):
@@ -454,9 +648,10 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
     await page.evaluate('''() => {
         const elements = document.querySelectorAll('style');
         for (const element of elements) {
-            if (element.innerText.includes('static.parastorage.com')) {
+            const text = element.textContent || '';
+            if (text.includes('static.parastorage.com')) {
                 // Get all occurences of url("//static.parastorage.com...") links
-                var fontLinks = element.innerText.match(/url\\((.*?)\\)/g);
+                var fontLinks = text.match(/url\\((.*?)\\)/g);
 
                 for (const link of fontLinks) {
                     // Only get if the link is a font
@@ -465,10 +660,11 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
                             
                         // Get the font name
                         // in javascript, not using split
-                        var fontName = link.substring(link.lastIndexOf('/') + 1, link.lastIndexOf(')')); 
+                        var fontName = link.substring(link.lastIndexOf('/') + 1, link.lastIndexOf(')'));
+                        fontName = fontName.replace(/['"]/g, '');
 
                         // Redo the src link
-                        element.innerText = element.innerText.replace(link, 'url("/fonts/' + fontName + '")');
+                        element.textContent = (element.textContent || '').replace(link, 'url("../fonts/' + fontName + '")');
                     }
                 }
 
@@ -479,9 +675,10 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
 async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData):
     
     # Get the current page
-    key = page.url.split(hostname)[1]
+    key = normalize_site_path(page.url, blockPrimaryFolder)
 
     print("Current page: " + key)
+    relative_prefix = build_relative_prefix(key)
     
     await asyncio.sleep(wait)
     await scroll_to_bottom(page)
@@ -498,12 +695,44 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
         }
     }''')
 
+    # Remove Wix chat, cookie banner, and similar remote widgets that break offline copies.
+    await page.evaluate('''() => {
+        const selectors = [
+            'iframe[title="Wix Chat"]',
+            'iframe[aria-label="Wix Chat"]',
+            '#pinnedBottomRight',
+            '#comp-jha2mdwx-pinned-layer',
+            '[data-hook="consent-banner-root"]',
+            '.consent-banner-root'
+        ];
+
+        for (const selector of selectors) {
+            document.querySelectorAll(selector).forEach((element) => element.remove());
+        }
+
+        document.querySelectorAll('script').forEach((element) => {
+            const src = element.getAttribute('src') || '';
+            const content = element.textContent || '';
+            if (
+                src.includes('chat') ||
+                src.includes('firebase') ||
+                src.includes('frog.wix.com') ||
+                src.includes('engage') ||
+                content.includes('firebase') ||
+                content.includes('chat-sdk')
+            ) {
+                element.remove();
+            }
+        });
+    }''')
+
     # In every font-face, add   font-display: swap; by going into the innertext of styles and replacing @font-face { with @font-face { font-display: swap;
     await page.evaluate('''() => {
         const elements = document.querySelectorAll('style');
         for (const element of elements) {
-            if (element.innerText.includes('@font-face')) {
-                element.innerText = element.innerText.replace('@font-face {', '@font-face { font-display: swap;');
+            const text = element.textContent || '';
+            if (text.includes('@font-face')) {
+                element.textContent = text.replace('@font-face {', '@font-face { font-display: swap;');
             }
         }
     }''')
@@ -545,9 +774,16 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     image = metatags[key]['image']
     author = metatags[key]['author']
 
+    title_js = json.dumps(title)
+    description_js = json.dumps(description)
+    keywords_js = json.dumps(keywords)
+    canonical_js = json.dumps(canonical)
+    image_js = json.dumps(image)
+    author_js = json.dumps(author)
+
     await page.evaluate(f'''() => {{
         const element = document.createElement('title');
-        element.innerText = '{title}';
+        element.textContent = {title_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -555,7 +791,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'title';
-        element.content = '{title}';
+        element.content = {title_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -563,14 +799,14 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.property = 'og:title';
-        element.content = '{title}';
+        element.content = {title_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'description';
-        element.content = '{description}';
+        element.content = {description_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -578,21 +814,21 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.property = 'og:description';
-        element.content = '{description}';
+        element.content = {description_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'keywords';
-        element.content = '{keywords}';
+        element.content = {keywords_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
     await page.evaluate(f'''() => {{
         const element = document.createElement('link');
         element.rel = 'canonical';
-        element.href = '{canonical}';
+        element.href = {canonical_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -600,7 +836,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.property = 'og:url';
-        element.content = '{canonical}';
+        element.content = {canonical_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -616,7 +852,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'twitter:url';
-        element.content = '{canonical}';
+        element.content = {canonical_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -624,7 +860,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'twitter:title';
-        element.content = '{title}';
+        element.content = {title_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -632,7 +868,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'twitter:description';
-        element.content = '{description}';
+        element.content = {description_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -640,7 +876,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'twitter:image';
-        element.content = '{image}';
+        element.content = {image_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -648,7 +884,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.property = 'og:image';
-        element.content = '{image}';
+        element.content = {image_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -656,7 +892,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await page.evaluate(f'''() => {{
         const element = document.createElement('meta');
         element.name = 'author';
-        element.content = '{author}';
+        element.content = {author_js};
         document.querySelector('head').appendChild(element);
     }}''')
 
@@ -700,37 +936,6 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
         document.querySelector('head').appendChild(element);
     }''')
 
-    # <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-    await page.evaluate('''() => {
-        const element = document.createElement('link');
-        element.rel = 'icon';
-        element.type = 'image/png';
-        element.sizes = '32x32';
-        element.href = '/favicon-32x32.png';
-        document.querySelector('head').appendChild(element);
-    }''')
-
-    # <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
-    await page.evaluate('''() => {
-        const element = document.createElement('link');
-        element.rel = 'icon';
-        element.type = 'image/png';
-        element.sizes = '16x16';
-        element.href = '/favicon-16x16.png';
-        document.querySelector('head').appendChild(element);
-    }''')
-
-    # <link rel="manifest" href="/site.webmanifest">
-    await page.evaluate('''() => {
-        const element = document.createElement('link');
-        element.rel = 'manifest';
-        element.href = '/site.webmanifest';
-        document.querySelector('head').appendChild(element);
-    }''')
-
-
-
-
     html = await page.evaluate('document.documentElement.outerHTML')
 
     html = html.replace('<br>', '')
@@ -750,6 +955,23 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
 
     # Any empty hrefs are now root hrefs, replace them with /
     html = html.replace('href=""', 'href="/"')
+
+    # Make hrefs relative so local file browsing works better.
+    html = html.replace('href="/"', f'href="{relative_prefix}index.html"')
+    html = re.sub(
+        r'href="/([^"#?]+?)/?"',
+        lambda match: f'href="{build_local_page_href(match.group(1), relative_prefix, blockPrimaryFolder)}"',
+        html,
+    )
+    html = re.sub(r'href="/(images|fonts)/', lambda match: f'href="{relative_prefix}{match.group(1)}/', html)
+    html = re.sub(r'src="/(images|fonts)/', lambda match: f'src="{relative_prefix}{match.group(1)}/', html)
+    html = rewrite_local_asset_paths(html, relative_prefix)
+
+    # Remove any remaining manifest and favicon references for offline copies.
+    html = re.sub(r'<link[^>]+rel="manifest"[^>]*>', '', html)
+    html = re.sub(r'<link[^>]+rel="icon"[^>]*favicon[^>]*>', '', html)
+    html = html.replace(' allow="clipboard-write;autoplay;camera;microphone;geolocation;vr"', ' allow="clipboard-write;autoplay;camera;microphone;geolocation"')
+    html = html.replace(' allowvr="true"', '')
 
     # Remove browser-sentry script
     html = html.replace('<script src="https://browser.sentry-cdn.com/6.18.2/bundle.min.js" defer></script>', '')
@@ -785,8 +1007,13 @@ async def main():
     # Get the hostname
     hostname = urlparse(site).hostname
 
-    # Use microsoft edge as the browser, set width and height to 1920x1080
-    browser = await launch(headless=False, defaultViewport= None, executablePath='C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', args=['--window-size=1920,1080'])
+    # Prefer Chrome on macOS, but fall back to any installed Chromium-based browser.
+    browser_executable = resolve_browser_executable()
+    launch_kwargs = dict(headless=False, defaultViewport=None, args=['--window-size=1920,1080'])
+    if browser_executable:
+        launch_kwargs['executablePath'] = browser_executable
+
+    browser = await launch(**launch_kwargs)
     
     page = await browser.newPage()
     await page.goto(site)
@@ -815,32 +1042,25 @@ async def main():
             errors = {}
             for link in links:
                 print(link)
-                if link in seen:
+                local_page_path = normalize_site_path(link, blockPrimaryFolder)
+                if local_page_path in seen:
                     continue
 
                 try:
 
                     await page.goto(link)
                     
-                    seen.append(link)
+                    seen.append(local_page_path)
 
                     html = await fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData)
 
-                    # Write each page as index.html to a folder named after the page
-                    # Check if the hostname is nested inside another folder
-                    # Count number of slashes
-                    newlink = link.replace('https://', '').replace('http://', '')
-
-                    if(newlink.count('/') > 1 and blockPrimaryFolder not in newlink.split('/')[1]):
-                        # Create the folder
-                        if not os.path.exists(hostname + '/' + '/'.join(newlink.split('/')[1:])):
-                            os.makedirs(hostname + '/' + '/'.join(newlink.split('/')[1:]))
-                        with open(hostname + '/' + '/'.join(newlink.split('/')[1:]) + '/index.html', 'w', encoding="utf-8") as f:
+                    if local_page_path == '/':
+                        with open(hostname + '/index.html', 'w', encoding="utf-8") as f:
                             f.write(html)
                     else:
-                        if not os.path.exists(hostname + '/' + link.split('/')[-1]):
-                            os.makedirs(hostname + '/' + link.split('/')[-1])
-                        with open(hostname + '/' + link.split('/')[-1] + '/index.html', 'w', encoding="utf-8") as f:
+                        destination_dir = os.path.join(hostname, local_page_path.strip('/'))
+                        os.makedirs(destination_dir, exist_ok=True)
+                        with open(os.path.join(destination_dir, 'index.html'), 'w', encoding="utf-8") as f:
                             f.write(html)
                 
                     await save_links(page, await page.querySelectorAllEval('a', 'nodes => nodes.map(n => n.href)'))
@@ -854,7 +1074,7 @@ async def main():
                         errors[link] = 1
 
                     if(errors[link] > 3):
-                        seen.append(link)
+                        seen.append(local_page_path)
                         print("Error: " + link + ". Giving up after 3 attempts. Added to seen list.")
                         continue
 
@@ -867,5 +1087,5 @@ async def main():
         
     #await browser.close()
 
-asyncio.get_event_loop().run_until_complete(main())
+asyncio.run(main())
 
