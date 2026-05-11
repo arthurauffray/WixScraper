@@ -11,6 +11,192 @@ import unicodedata
 import shutil
 from PIL import Image
 
+try:
+    import csscompressor
+except ImportError:
+    csscompressor = None
+
+try:
+    from jsmin import jsmin as jsmin_function
+except ImportError:
+    jsmin_function = None
+
+SCRAPES_DIR = 'scrapes'
+DEFAULT_REQUEST_TIMEOUT = 30
+OUTPUT_FORMAT_NONE = 'none'
+OUTPUT_FORMAT_MINIFY = 'minify'
+OUTPUT_FORMAT_BEAUTIFY = 'beautify'
+
+
+def ensure_directory(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def build_site_output_dir(hostname):
+    return os.path.join(SCRAPES_DIR, hostname)
+
+
+def collapse_leading_blank_lines(html):
+    return re.sub(r'^(?:\s*\n)+', '', html)
+
+
+def normalize_output_format(value):
+    if not isinstance(value, str):
+        return OUTPUT_FORMAT_NONE
+
+    normalized_value = value.strip().lower()
+    if normalized_value in {OUTPUT_FORMAT_NONE, OUTPUT_FORMAT_MINIFY, OUTPUT_FORMAT_BEAUTIFY}:
+        return normalized_value
+    return OUTPUT_FORMAT_NONE
+
+
+def collapse_empty_tag_gaps(html):
+    html = re.sub(r'>\s*\n(?:\s*\n)+\s*<', '><', html)
+    html = re.sub(r'>\n\s+<', '><', html)
+    html = re.sub(r'\n(?:\s*\n)+', '\n', html)
+    html = re.sub(r'</style>\s+<style', '</style><style', html)
+    html = re.sub(r'</script>\s+<script', '</script><script', html)
+    return html
+
+
+def remove_empty_html_comments(html):
+    html = re.sub(r'\s*<!--\s*(?:BEGIN|END)?[^>]*-->\s*(?=<)', '', html)
+    html = re.sub(r'\s*<!--\s*<link[^>]*wix\.com/favicon\.ico[^>]*>\s*-->\s*', '', html, flags=re.I)
+    return html
+
+
+def minify_inline_blocks(html):
+    def minify_css(match):
+        css = match.group(1)
+        css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
+        css = re.sub(r'\s+', ' ', css)
+        css = re.sub(r'\s*([{}:;,])\s*', r'\1', css)
+        css = re.sub(r';}', '}', css)
+        return f'<style>{css.strip()}</style>'
+
+    def minify_js(match):
+        js = match.group(1)
+        js = re.sub(r'//.*', '', js)
+        js = re.sub(r'\s+', ' ', js)
+        js = re.sub(r'\s*([{}();,:=+<>\-])\s*', r'\1', js)
+        return f'<script>{js.strip()}</script>'
+
+    html = re.sub(r'<style>(.*?)</style>', minify_css, html, flags=re.S)
+    html = re.sub(r'<script>(.*?)</script>', minify_js, html, flags=re.S)
+    return html
+
+
+def minify_inline_assets_with_libraries(html):
+    def minify_css(match):
+        css = match.group(1)
+        minified_css = csscompressor.compress(css) if csscompressor else css
+        return f'<style>{minified_css.strip()}</style>'
+
+    def minify_js(match):
+        attributes = match.group(1) or ''
+        js = match.group(2)
+        lowered_attributes = attributes.lower()
+        if 'src=' in lowered_attributes:
+            return match.group(0)
+        if 'application/ld+json' in lowered_attributes or 'application/json' in lowered_attributes:
+            return match.group(0)
+        if not jsmin_function:
+            return match.group(0)
+        return f'<script{attributes}>{jsmin_function(js).strip()}</script>'
+
+    html = re.sub(r'<style>(.*?)</style>', minify_css, html, flags=re.S)
+    html = re.sub(r'<script([^>]*)>(.*?)</script>', minify_js, html, flags=re.S)
+    return html
+
+
+def beautify_html_output(html):
+    indent_level = 0
+    tokens = re.split(r'(<[^>]+>)', html)
+    lines = []
+    void_tags = {
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+        'link', 'meta', 'param', 'source', 'track', 'wbr'
+    }
+
+    for token in tokens:
+        if not token:
+            continue
+
+        stripped = token.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith('<'):
+            tag_match = re.match(r'</?\s*([a-zA-Z0-9:_-]+)', stripped)
+            tag_name = tag_match.group(1).lower() if tag_match else ''
+            is_closing_tag = stripped.startswith('</')
+            is_comment = stripped.startswith('<!--')
+            is_declaration = stripped.startswith('<!') and not is_comment
+            is_processing = stripped.startswith('<?')
+            is_self_closing = stripped.endswith('/>') or tag_name in void_tags or is_comment or is_declaration or is_processing
+
+            if is_closing_tag:
+                indent_level = max(indent_level - 1, 0)
+
+            lines.append(('  ' * indent_level) + stripped)
+
+            if not is_closing_tag and not is_self_closing:
+                indent_level += 1
+        else:
+            collapsed_text = re.sub(r'\s+', ' ', stripped)
+            if collapsed_text:
+                lines.append(('  ' * indent_level) + collapsed_text)
+
+    return '\n'.join(lines) + '\n'
+
+
+def conservative_html_minify(html):
+    placeholders = []
+
+    def store_placeholder(match):
+        placeholders.append(match.group(0))
+        return f'___HTML_PLACEHOLDER_{len(placeholders) - 1}___'
+
+    protected_pattern = r'<(pre|textarea|script|style)\b[^>]*>.*?</\1>'
+    html = re.sub(protected_pattern, store_placeholder, html, flags=re.S | re.I)
+    html = re.sub(r'<!--(?!\[if).*?-->', '', html, flags=re.S)
+    html = re.sub(r'>\s+<', '><', html)
+    html = re.sub(r'\s{2,}', ' ', html)
+    html = html.strip()
+
+    for index, original_block in enumerate(placeholders):
+        html = html.replace(f'___HTML_PLACEHOLDER_{index}___', original_block)
+
+    return html
+
+
+def format_final_output(html, output_format):
+    if output_format == OUTPUT_FORMAT_MINIFY:
+        html = minify_inline_assets_with_libraries(html)
+        return conservative_html_minify(html)
+
+    if output_format == OUTPUT_FORMAT_BEAUTIFY:
+        return beautify_html_output(html)
+
+    return html
+
+
+def is_valid_font_response(response, font_name):
+    content_type = (response.headers.get('content-type') or '').lower()
+    body_prefix = response.content[:512].lower()
+    allowed_tokens = ('font', 'application/octet-stream', 'binary/octet-stream', 'svg+xml')
+    denied_tokens = (b'access denied', b'<html', b'<?xml', b'error 403', b'forbidden')
+    has_allowed_type = any(token in content_type for token in allowed_tokens)
+    has_denied_body = any(token in body_prefix for token in denied_tokens)
+    has_font_extension = font_name.lower().endswith(('.woff', '.woff2', '.ttf', '.eot', '.otf', '.svg'))
+    return has_font_extension and response.ok and not has_denied_body and (has_allowed_type or font_name.lower().endswith('.svg'))
+
+
+def append_font_warning(warnings_path, message):
+    with open(warnings_path, 'a', encoding='utf-8') as warnings_file:
+        warnings_file.write(message + '\n')
+
 
 def bool_from_config(value, default=False):
     if isinstance(value, bool):
@@ -373,6 +559,10 @@ async def fix_slideshow(page):
 
         slides = await page.querySelectorAll('nav[aria-label="Slides"] li')
 
+        if not slides:
+            print("Slideshow found but no slide controls were available. Skipping slideshow conversion.")
+            return
+
         # Ensure first slide is selected
         await asyncio.sleep(5)
         await slides[0].click()
@@ -385,8 +575,14 @@ async def fix_slideshow(page):
             #img_parents = await gallery.querySelectorAllEval('img', 'nodes => nodes.map(n => n.parentNode.parentNode.innerHTML)')
             slide_content = await page.querySelector('div[data-testid="slidesWrapper"] > div')
 
+            if slide_content is None:
+                continue
+
             # Get innerHTML of slide_content
             parent = await page.evaluate('(slide_content) => slide_content.innerHTML', slide_content)
+
+            if not parent:
+                continue
 
             # Get all parents of img tags, iterate over and add them instead
             await page.evaluate(f'''(parent) => {{
@@ -491,8 +687,7 @@ lightModeFix = '''<style>
 
 async def makeLocalImages(page, hostname, forceDownloadAgain):
         # Create images folder if it doesn't exist in hostname folder
-    if not os.path.exists(hostname + '/images'):
-        os.makedirs(hostname + '/images')
+    images_dir = ensure_directory(os.path.join(hostname, 'images'))
 
     def build_image_name(link):
         cleaned_link = link.split('?')[0].split('#')[0]
@@ -555,29 +750,30 @@ async def makeLocalImages(page, hostname, forceDownloadAgain):
         imageName = build_image_name(link)
         imageBaseName = os.path.splitext(imageName)[0]
 
-        if(not forceDownloadAgain and os.path.exists(hostname + '/images/' + imageBaseName + '.webp')):
+        if(not forceDownloadAgain and os.path.exists(os.path.join(images_dir, imageBaseName + '.webp'))):
             continue
 
         try:
             # Fetch each image and save it to the images folder
             # Download using requests
-            r = requests.get(link, allow_redirects=True)
+            r = requests.get(link, allow_redirects=True, timeout=DEFAULT_REQUEST_TIMEOUT)
 
             contentType = r.headers.get('content-type', '')
             if('image' not in contentType and not imageName.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.svg'))):
                 continue
 
-            open(hostname + '/images/' + imageName, 'wb').write(r.content)
+            image_path = os.path.join(images_dir, imageName)
+            open(image_path, 'wb').write(r.content)
 
             # Convert each image to WebP
-            im = Image.open(hostname + '/images/' + imageName)
-            im.save(hostname + '/images/' + imageBaseName + '.webp', 'webp')
+            im = Image.open(image_path)
+            im.save(os.path.join(images_dir, imageBaseName + '.webp'), 'webp')
         except Exception as e:
             print(f"Skipping image {link}: {e}")
             continue
 
         # Delete the original image
-        os.remove(hostname + '/images/' + imageName)
+        os.remove(os.path.join(images_dir, imageName))
 
     # Replace all image links with the local image links, using the webp format
     await page.evaluate(r'''() => {
@@ -709,8 +905,10 @@ def rewrite_local_asset_paths(html, relative_prefix):
 async def makeFontsLocal(page, hostname, forceDownloadAgain):
         # Make all fonts local
     # Create a fonts folder if it doesn't exist in hostname folder
-    if not os.path.exists(hostname + '/fonts'):
-        os.makedirs(hostname + '/fonts')
+    fonts_dir = ensure_directory(os.path.join(hostname, 'fonts'))
+    warnings_path = os.path.join(hostname, 'font-warnings.log')
+    if os.path.exists(warnings_path):
+        os.remove(warnings_path)
 
     # Download all fonts, which are parastorage links
     fontLinks = await page.querySelectorAllEval('style', 'nodes => nodes.map(n => ((n.textContent || "").match(/url\\((.*?)\\)/g) || [])).flat()')
@@ -737,11 +935,19 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
         fontName = fontName.replace("'", '')
         
         # If the font already exists, skip it
-        if(not forceDownloadAgain and os.path.exists(hostname + '/fonts/' + fontName)):
+        target_font_path = os.path.join(fonts_dir, fontName)
+        if(not forceDownloadAgain and os.path.exists(target_font_path)):
             continue
         
-        r = requests.get("https://" + link, allow_redirects=True)
-        open(hostname + '/fonts/' + fontName, 'wb').write(r.content)
+        try:
+            r = requests.get("https://" + link, allow_redirects=True, timeout=DEFAULT_REQUEST_TIMEOUT)
+            if not is_valid_font_response(r, fontName):
+                append_font_warning(warnings_path, f'Skipped invalid font response for {fontName} from https://{link}')
+                continue
+            open(target_font_path, 'wb').write(r.content)
+        except Exception as exc:
+            append_font_warning(warnings_path, f'Failed to download {fontName} from https://{link}: {exc}')
+            continue
 
     # Replace all font links with the local font links where the font file name is the last item after the last slash
     await page.evaluate('''() => {
@@ -771,7 +977,7 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
         }
     }''')
 
-async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData):
+async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData, outputFormat):
     
     # Get the current page
     key = normalize_site_path(page.url, blockPrimaryFolder)
@@ -1072,7 +1278,8 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
 
     # Remove any remaining manifest and favicon references for offline copies.
     html = re.sub(r'<link[^>]+rel="manifest"[^>]*>', '', html)
-    html = re.sub(r'<link[^>]+rel="icon"[^>]*favicon[^>]*>', '', html)
+    html = re.sub(r'<link[^>]+rel="(?:shortcut\s+)?icon"[^>]*>', '', html)
+    html = re.sub(r'<meta[^>]+property="og:site_name"[^>]*>', '', html)
     html = html.replace(' allow="clipboard-write;autoplay;camera;microphone;geolocation;vr"', ' allow="clipboard-write;autoplay;camera;microphone;geolocation"')
     html = html.replace(' allowvr="true"', '')
 
@@ -1085,7 +1292,12 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     '''<script src="https://cdn.jsdelivr.net/npm/jquery@3.6.4/dist/jquery.min.js" defer=""></script><script>window.addEventListener('DOMContentLoaded', function() { jQuery.event.special.touchstart = { setup: function( _, ns, handle ) { this.addEventListener("touchstart", handle, { passive: !ns.includes("noPreventDefault") }); } }; jQuery.event.special.touchmove = { setup: function( _, ns, handle ) { this.addEventListener("touchmove", handle, { passive: !ns.includes("noPreventDefault") }); } }; jQuery.event.special.wheel = { setup: function( _, ns, handle ){ this.addEventListener("wheel", handle, { passive: true }); } }; jQuery.event.special.mousewheel = { setup: function( _, ns, handle ){ this.addEventListener("mousewheel", handle, { passive: true }); } }; });</script>''')
 
     # Add doctype HTML to start 
-    html = '<!DOCTYPE html>' + html
+    html = minify_inline_blocks(html)
+    html = remove_empty_html_comments(html)
+    html = collapse_empty_tag_gaps(html)
+    html = collapse_leading_blank_lines(html)
+    html = '<!DOCTYPE html>' + html.lstrip()
+    html = format_final_output(html, outputFormat)
 
     return html
 
@@ -1118,9 +1330,12 @@ async def main():
     mapData = data.get('mapData')
     if not isinstance(mapData, dict):
         mapData = {}
+    outputFormat = normalize_output_format(data.get('outputFormat', OUTPUT_FORMAT_NONE))
 
     # Get the hostname
     hostname = urlparse(site).hostname
+    output_dir = build_site_output_dir(hostname)
+    ensure_directory(SCRAPES_DIR)
 
     # Prefer Chrome on macOS, but fall back to any installed Chromium-based browser.
     browser_executable = resolve_browser_executable()
@@ -1140,12 +1355,11 @@ async def main():
     print(site)
 
     # Fix the first page
-    html = await fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData)
+    html = await fix_page(page, wait, output_dir, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData, outputFormat)
 
-    if not os.path.exists(hostname):
-        os.mkdir(hostname)
+    ensure_directory(output_dir)
 
-    with open(hostname + '/index.html', 'w', encoding="utf-8") as f:
+    with open(os.path.join(output_dir, 'index.html'), 'w', encoding="utf-8") as f:
         f.write(html)
 
     if(recursive): 
@@ -1171,13 +1385,13 @@ async def main():
                     
                     seen.append(local_page_path)
 
-                    html = await fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData)
+                    html = await fix_page(page, wait, output_dir, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData, outputFormat)
 
                     if local_page_path == '/':
-                        with open(hostname + '/index.html', 'w', encoding="utf-8") as f:
+                        with open(os.path.join(output_dir, 'index.html'), 'w', encoding="utf-8") as f:
                             f.write(html)
                     else:
-                        destination_dir = os.path.join(hostname, local_page_path.strip('/'))
+                        destination_dir = os.path.join(output_dir, local_page_path.strip('/'))
                         os.makedirs(destination_dir, exist_ok=True)
                         with open(os.path.join(destination_dir, 'index.html'), 'w', encoding="utf-8") as f:
                             f.write(html)
