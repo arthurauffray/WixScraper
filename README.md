@@ -22,18 +22,24 @@ Wix Scraper:
 
 ## Configuration
 
-To run Wix Scraper for any Wix website, you need to set up a configuration file (config.json) like the one below:
+To run Wix Scraper for any Wix website, generate a configuration file first instead of editing JSON by hand:
+
+```bash
+python scripts/init_config.py "https://example.wixsite.com/example1"
+```
+
+That writes `config.json` with sensible defaults and whatever page metadata the site exposes. If you need custom page overrides, use the JSON shape below.
 
 ```json
 {
     "site": "https://example.wixsite.com/example1",
     "blockPrimaryFolder": "example1",
     "wait": 3,
-    "recursive": "True",
-    "darkWebsite": "False",
-    "forceDownloadAgain": "False",
+    "recursive": true,
+    "darkWebsite": false,
+    "forceDownloadAgain": false,
     "metatags": {
-        "/example1": {
+        "/": {
             "title": "Example1 | The Best Wix Website",
             "description": "Example1 is the best Wix website of all time.",
             "keywords": "example keyword, example1 keyword",
@@ -41,7 +47,7 @@ To run Wix Scraper for any Wix website, you need to set up a configuration file 
             "image": "https://example1.com/banner.png",
             "author": "Example1 Author"
         },
-        "/example1/about": {
+        "/about": {
             "title": "About | Example1 Website",
             "description": "About Example1 which is the best Wix website of all time.",
             "keywords": "example keyword, example1 keyword",
@@ -71,12 +77,12 @@ To run Wix Scraper for any Wix website, you need to set up a configuration file 
 - `recursive`: If set to "True", the scraper will scrape all pages linked from the initial page.
 - `darkWebsite`: If set to "True", the scraper will apply a dark mode theme to the scraped website.
 - `forceDownloadAgain`: If set to "True", the scraper will download all files again, even if they already exist in the target directory.
-- `metatags`: This is a dictionary containing the metadata of each page on the website. This includes the title, description, keywords, canonical URL, image URL, and author of each page.
+- `metatags`: This is a dictionary containing the metadata of each normalized page path, such as `/` and `/about`. It includes the title, description, keywords, canonical URL, image URL, and author.
 - `mapData`: This is the data required to display a map on the website. This includes the latitude and longitude of the location, the zoom level of the map, and the details of the map marker.
 
 ## Usage
 
-To run Wix Scraper, first fill in the configuration file. Then, use the following command:
+To run Wix Scraper, generate or edit `config.json`, then use the following command:
 
 ```bash
 python wixscraper.py
