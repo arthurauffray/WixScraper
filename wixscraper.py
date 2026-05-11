@@ -357,6 +357,13 @@ async def fix_gallery(page):
     gallery = await page.querySelector('.pro-gallery')
 
     if(gallery != None):
+        is_blog_post_list = await page.evaluate('''(gallery) => {
+            return !!gallery.closest('[class*="post-list-pro-gallery-"], .related-posts, .my-posts');
+        }''', gallery)
+
+        if is_blog_post_list:
+            print("Found blog post list gallery; skipping gallery rewrite.")
+            return
 
         print("Found gallery! Fixing..")
         
