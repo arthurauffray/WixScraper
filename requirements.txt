@@ -1,0 +1,5 @@
+playwright>=1.52.0
+requests>=2.32.0
+Pillow>=10.0.0
+csscompressor>=0.9.5
+jsmin>=3.0.1
