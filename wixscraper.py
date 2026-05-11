@@ -11,6 +11,101 @@ import unicodedata
 import shutil
 from PIL import Image
 
+
+def bool_from_config(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in {'true', '1', 'yes', 'y', 'on'}:
+            return True
+        if normalized_value in {'false', '0', 'no', 'n', 'off'}:
+            return False
+    return default
+
+
+def int_from_config(value, default=0):
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        return int(str(value).strip())
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+
+def normalize_site_label(hostname):
+    if not hostname:
+        return 'Wix Site'
+
+    label = hostname
+    if label.endswith('.wixsite.com'):
+        label = label[:-len('.wixsite.com')]
+
+    label = label.replace('www.', '')
+    label = re.sub(r'[^A-Za-z0-9]+', ' ', label).strip()
+    if not label:
+        return 'Wix Site'
+
+    return ' '.join(part.capitalize() for part in label.split())
+
+
+def infer_block_primary_folder(site):
+    normalized_site = site if '://' in site else f'https://{site}'
+    parsed_site = urllib.parse.urlsplit(normalized_site)
+    path_segments = [segment for segment in parsed_site.path.split('/') if segment]
+    if path_segments:
+        return path_segments[0]
+
+    hostname = parsed_site.hostname or ''
+    if hostname.endswith('.wixsite.com'):
+        return hostname.split('.wixsite.com', 1)[0]
+
+    return ''
+
+
+def has_map_configuration(map_data):
+    if not isinstance(map_data, dict):
+        return False
+
+    map_marker = map_data.get('mapMarker')
+    if not isinstance(map_marker, dict):
+        return False
+
+    required_page_fields = ('latitude', 'longitude', 'zoom')
+    required_marker_fields = ('latitude', 'longitude', 'popup')
+    return all(map_data.get(field) not in (None, '') for field in required_page_fields) and all(
+        map_marker.get(field) not in (None, '') for field in required_marker_fields
+    )
+
+
+def resolve_page_metadata(page_title, page_url, hostname, root_metadata, page_metadata):
+    root_metadata = root_metadata if isinstance(root_metadata, dict) else {}
+    page_metadata = page_metadata if isinstance(page_metadata, dict) else {}
+    site_label = normalize_site_label(hostname)
+    page_title = page_title.strip() if isinstance(page_title, str) else ''
+    default_title = page_title or root_metadata.get('title') or site_label
+    default_description = f'Offline copy of {default_title} from {site_label}.'
+
+    parsed_page_url = urllib.parse.urlsplit(page_url or '')
+    canonical_url = urllib.parse.urlunsplit((
+        parsed_page_url.scheme,
+        parsed_page_url.netloc,
+        parsed_page_url.path,
+        '',
+        '',
+    ))
+
+    return {
+        'title': page_metadata.get('title') or default_title,
+        'description': page_metadata.get('description') or default_description,
+        'keywords': page_metadata.get('keywords') or root_metadata.get('keywords') or default_title,
+        'canonical': page_metadata.get('canonical') or canonical_url or page_url or '',
+        'image': page_metadata.get('image') or root_metadata.get('image') or '',
+        'author': page_metadata.get('author') or root_metadata.get('author') or '',
+    }
+
 # Scroll to the bottom to load all content
 async def scroll_to_bottom(page):
     pageHeight = await page.evaluate('document.body.scrollHeight')
@@ -152,6 +247,10 @@ async def fix_googlemap(page, mapData):
     if(googlemap != None):
 
         print("Found Google Maps! Fixing..")
+
+        if not has_map_configuration(mapData):
+            print("Found Google Maps, but mapData is missing or incomplete. Leaving the embedded map unchanged.")
+            return
 
         # Import leaflet
         await page.addStyleTag(url='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.css')
@@ -687,6 +786,15 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     await fix_googlemap(page, mapData)
     await fix_slideshow(page)
 
+    try:
+        page_title = await page.title()
+    except Exception:
+        page_title = ''
+
+    root_metatags = metatags.get('/') if isinstance(metatags, dict) else {}
+    page_metatags = metatags.get(key) if isinstance(metatags, dict) else {}
+    resolved_metatags = resolve_page_metadata(page_title, page.url, hostname, root_metatags, page_metatags)
+
     # Defer all scripts
     await page.evaluate('''() => {
         const elements = document.querySelectorAll('script');
@@ -762,17 +870,12 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
         }
     }''')
 
-
-    if(key not in metatags):
-        print("Warning: No metatags defined for this page. Using default metatags.")
-        key = '/'
-       
-    title = metatags[key]['title']
-    description = metatags[key]['description']
-    keywords = metatags[key]['keywords']
-    canonical = metatags[key]['canonical']
-    image = metatags[key]['image']
-    author = metatags[key]['author']
+    title = resolved_metatags['title']
+    description = resolved_metatags['description']
+    keywords = resolved_metatags['keywords']
+    canonical = resolved_metatags['canonical']
+    image = resolved_metatags['image']
+    author = resolved_metatags['author']
 
     title_js = json.dumps(title)
     description_js = json.dumps(description)
@@ -992,26 +1095,42 @@ async def main():
     
     """ Variable Declarations """
     # Load the data in from the json file
-    with open('config.json') as f:
-        data = json.load(f)
+    try:
+        with open('config.json', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError('config.json not found. Run python scripts/init_config.py <site> to generate one.') from exc
 
-    site = data['site']
-    blockPrimaryFolder = data['blockPrimaryFolder']
-    wait = data['wait']
-    recursive = data['recursive'].lower() == 'true'
-    darkWebsite = data['darkWebsite'].lower() == 'true'
-    forceDownloadAgain = data['forceDownloadAgain'].lower() == 'true'
-    metatags = data['metatags']
-    mapData = data['mapData']
+    site = data.get('site')
+    if not site:
+        raise ValueError('config.json must include a site URL.')
+
+    blockPrimaryFolder = data.get('blockPrimaryFolder') or infer_block_primary_folder(site)
+    wait = int_from_config(data.get('wait', 3), 3)
+    recursive = bool_from_config(data.get('recursive', True), True)
+    darkWebsite = bool_from_config(data.get('darkWebsite', False), False)
+    forceDownloadAgain = bool_from_config(data.get('forceDownloadAgain', False), False)
+
+    metatags = data.get('metatags')
+    if not isinstance(metatags, dict):
+        metatags = {}
+
+    mapData = data.get('mapData')
+    if not isinstance(mapData, dict):
+        mapData = {}
 
     # Get the hostname
     hostname = urlparse(site).hostname
 
     # Prefer Chrome on macOS, but fall back to any installed Chromium-based browser.
     browser_executable = resolve_browser_executable()
-    launch_kwargs = dict(headless=False, defaultViewport=None, args=['--window-size=1920,1080'])
+    launch_kwargs = {
+        'headless': False,
+        'defaultViewport': None,
+        'args': ['--window-size=1920,1080'],
+    }
     if browser_executable:
-        launch_kwargs['executablePath'] = browser_executable
+        launch_kwargs = {**launch_kwargs, 'executablePath': browser_executable}
 
     browser = await launch(**launch_kwargs)
     
@@ -1087,5 +1206,6 @@ async def main():
         
     #await browser.close()
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
 
