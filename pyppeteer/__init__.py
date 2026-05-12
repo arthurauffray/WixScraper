@@ -63,8 +63,16 @@ class _PageWrapper:
     def url(self):
         return self.page.url
 
-    async def goto(self, url: str):
-        return await self.page.goto(url)
+    async def goto(self, url: str, wait_until: str | None = None, timeout: int | None = None):
+        kwargs = {}
+        if wait_until is not None:
+            kwargs["wait_until"] = wait_until
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return await self.page.goto(url, **kwargs)
+
+    async def setDefaultNavigationTimeout(self, timeout_ms: int):
+        self.page.set_default_navigation_timeout(timeout_ms)
 
     async def evaluate(self, expression: str, arg: Any = None):
         if isinstance(arg, _ElementHandleWrapper):

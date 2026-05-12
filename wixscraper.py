@@ -23,6 +23,7 @@ except ImportError:
 
 SCRAPES_DIR = 'scrapes'
 DEFAULT_REQUEST_TIMEOUT = 30
+DEFAULT_NAVIGATION_TIMEOUT = 120000
 OUTPUT_FORMAT_NONE = 'none'
 OUTPUT_FORMAT_MINIFY = 'minify'
 OUTPUT_FORMAT_BEAUTIFY = 'beautify'
@@ -1357,7 +1358,8 @@ async def main():
     browser = await launch(**launch_kwargs)
     
     page = await browser.newPage()
-    await page.goto(site)
+    await page.setDefaultNavigationTimeout(DEFAULT_NAVIGATION_TIMEOUT)
+    await page.goto(site, wait_until='domcontentloaded', timeout=DEFAULT_NAVIGATION_TIMEOUT)
     
     print(site)
 
@@ -1388,7 +1390,7 @@ async def main():
 
                 try:
 
-                    await page.goto(link)
+                    await page.goto(link, wait_until='domcontentloaded', timeout=DEFAULT_NAVIGATION_TIMEOUT)
                     
                     seen.append(local_page_path)
 
