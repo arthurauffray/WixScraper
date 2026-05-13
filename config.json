@@ -6,6 +6,7 @@
   "darkWebsite": false,
   "forceDownloadAgain": false,
   "outputFormat": "minify",
+  "publicSite": "https://example1.com",
   "metatags": {
     "/example1": {
       "title": "Example1 | The Best Wix Website",

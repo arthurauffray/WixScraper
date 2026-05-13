@@ -1,6 +1,6 @@
 # Import puppeteer
 import json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 import urllib.parse
 from pyppeteer import launch
 import re
@@ -36,6 +36,15 @@ def ensure_directory(path):
 
 def build_site_output_dir(hostname):
     return os.path.join(SCRAPES_DIR, hostname)
+
+
+def normalize_absolute_url(value):
+    cleaned_value = (value or '').strip()
+    if not cleaned_value:
+        return ''
+    if '://' not in cleaned_value:
+        cleaned_value = f'https://{cleaned_value}'
+    return cleaned_value
 
 
 def collapse_leading_blank_lines(html):
@@ -300,6 +309,59 @@ async def scroll_to_bottom(page):
         await page.evaluate(f'window.scrollTo(0, {i})')
         await asyncio.sleep(0.1)
     await asyncio.sleep(1)
+
+
+async def expand_load_more(page):
+    for _ in range(10):
+        clicked = await page.evaluate('''() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            for (const button of buttons) {
+                if (button.disabled) {
+                    continue;
+                }
+
+                const hook = (button.getAttribute('data-hook') || '').trim();
+                const text = (button.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (
+                    hook === 'Profile-LoadMorePostsButton' ||
+                    text === 'voir plus' ||
+                    text === 'load more' ||
+                    text === 'see more' ||
+                    text === 'more'
+                ) {
+                    button.click();
+                    return true;
+                }
+            }
+
+            return false;
+        }''')
+
+        if not clicked:
+            return
+
+        await asyncio.sleep(1)
+        await scroll_to_bottom(page)
+
+
+def rewrite_public_site_urls(html, source_site_url, public_site_url):
+    if not public_site_url:
+        return html
+
+    source_site_url = normalize_absolute_url(source_site_url).rstrip('/')
+    public_site_url = normalize_absolute_url(public_site_url).rstrip('/')
+    source_hostname = urlsplit(source_site_url).hostname or ''
+    public_hostname = urlsplit(public_site_url).hostname or ''
+
+    html = html.replace(source_site_url, public_site_url)
+    html = html.replace(source_site_url + '/', public_site_url + '/')
+
+    if source_hostname and public_hostname:
+        html = html.replace(f'https://{source_hostname}', f'https://{public_hostname}')
+        html = html.replace(f'http://{source_hostname}', f'http://{public_hostname}')
+        html = html.replace(f'//{source_hostname}', f'//{public_hostname}')
+
+    return html
 
 # Only use this function in compliance with Wix Terms of Service. 
 async def delete_wix(page):
@@ -985,7 +1047,7 @@ async def makeFontsLocal(page, hostname, forceDownloadAgain):
         }
     }''')
 
-async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData, outputFormat):
+async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData, outputFormat, source_site_url='', public_site_url=''):
     
     # Get the current page
     key = normalize_site_path(page.url, blockPrimaryFolder)
@@ -995,6 +1057,7 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
     
     await asyncio.sleep(wait)
     await scroll_to_bottom(page)
+    await expand_load_more(page)
     await delete_wix(page)
     await fix_gallery(page)
     await fix_googlemap(page, mapData)
@@ -1255,6 +1318,8 @@ async def fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceD
 
     html = await page.evaluate('document.documentElement.outerHTML')
 
+    html = rewrite_public_site_urls(html, source_site_url, public_site_url)
+
     html = html.replace('<br>', '')
     html = html.replace('</body>', slideFix)
     if(darkWebsite):
@@ -1330,6 +1395,12 @@ async def main():
     recursive = bool_from_config(data.get('recursive', True), True)
     darkWebsite = bool_from_config(data.get('darkWebsite', False), False)
     forceDownloadAgain = bool_from_config(data.get('forceDownloadAgain', False), False)
+    publicSite = data.get('publicSite') or ''
+    seedUrls = data.get('seedUrls') or []
+    if isinstance(seedUrls, str):
+        seedUrls = [seedUrls]
+    elif not isinstance(seedUrls, list):
+        seedUrls = []
 
     metatags = data.get('metatags')
     if not isinstance(metatags, dict):
@@ -1364,7 +1435,7 @@ async def main():
     print(site)
 
     # Fix the first page
-    html = await fix_page(page, wait, output_dir, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData, outputFormat)
+    html = await fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData, outputFormat, site, publicSite)
 
     ensure_directory(output_dir)
 
@@ -1379,7 +1450,14 @@ async def main():
             links = [link for link in links if hostname in link]
             # Delete all links with hash
             links = [link for link in links if '#' not in link]
-            links = set(links)
+            ordered_links = []
+            seen_links = set()
+            for link in links:
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+                ordered_links.append(link)
+            links = ordered_links
             #print(links)
             errors = {}
             for link in links:
@@ -1394,7 +1472,7 @@ async def main():
                     
                     seen.append(local_page_path)
 
-                    html = await fix_page(page, wait, output_dir, blockPrimaryFolder, darkWebsite, forceDownloadAgain,metatags, mapData, outputFormat)
+                    html = await fix_page(page, wait, hostname, blockPrimaryFolder, darkWebsite, forceDownloadAgain, metatags, mapData, outputFormat, site, publicSite)
 
                     if local_page_path == '/':
                         with open(os.path.join(output_dir, 'index.html'), 'w', encoding="utf-8") as f:
@@ -1425,7 +1503,7 @@ async def main():
 
                     continue
 
-        await save_links(page, await page.querySelectorAllEval('a', 'nodes => nodes.map(n => n.href)'))
+        await save_links(page, [site, *seedUrls, *await page.querySelectorAllEval('a', 'nodes => nodes.map(n => n.href)')])
         
     #await browser.close()
 

@@ -33,6 +33,7 @@ That writes `config.json` with sensible defaults and whatever page metadata the 
 ```json
 {
     "site": "https://example.wixsite.com/example1",
+    "publicSite": "https://example.com",
     "blockPrimaryFolder": "example1",
     "wait": 3,
     "recursive": true,
@@ -72,6 +73,7 @@ That writes `config.json` with sensible defaults and whatever page metadata the 
 ### Configuration Variables
 
 - `site`: This is the URL of the Wix website you want to scrape.
+- `publicSite`: This is the public domain you want to emit in rewritten canonical and absolute URLs.
 - `blockPrimaryFolder`: This is the primary folder after "wixsite.com" if one exists.
 - `wait`: This is the time (in seconds) the scraper waits before loading a new page.
 - `recursive`: If set to "True", the scraper will scrape all pages linked from the initial page.
